@@ -29,7 +29,7 @@
 #include <linux/in6.h>
 #include <linux/if_arp.h>
 #include <linux/if_vlan.h>
-
+#include <linux/moduleparam.h>
 #include <net/dst.h>
 #include <net/ip.h>
 #include <net/ipv6.h>
@@ -38,6 +38,7 @@
 #include <net/dsfield.h>
 #include <net/mpls.h>
 #include <net/sctp/checksum.h>
+#include <net/vxlan.h>
 
 #include "datapath.h"
 #include "flow.h"
@@ -651,7 +652,8 @@ static int ovs_vport_output(struct sock *sock, struct sk_buff *skb)
 	skb_postpush_rcsum(skb, skb->data, data->l2_len);
 	skb_reset_mac_header(skb);
 
-	ovs_vport_send(vport, skb);
+	ovs_vport_send(vport, skb, NULL);
+	
 	return 0;
 }
 
@@ -745,7 +747,7 @@ err:
 }
 
 static void do_output(struct datapath *dp, struct sk_buff *skb, int out_port,
-		      struct sw_flow_key *key)
+		      struct sw_flow_key *key, struct ovs_encap_context *encap_context)
 {
 	struct vport *vport = ovs_vport_rcu(dp, out_port);
 
@@ -753,7 +755,7 @@ static void do_output(struct datapath *dp, struct sk_buff *skb, int out_port,
 		u16 mru = OVS_CB(skb)->mru;
 
 		if (likely(!mru || (skb->len <= mru + ETH_HLEN))) {
-			ovs_vport_send(vport, skb);
+			ovs_vport_send(vport, skb, encap_context);
 		} else if (mru <= vport->dev->mtu) {
 			__be16 ethertype = key->eth.type;
 
@@ -1026,7 +1028,8 @@ static int execute_recirc(struct datapath *dp, struct sk_buff *skb,
 
 	return 0;
 }
-
+static uint withEncapAcceleration = 1;
+module_param(withEncapAcceleration, uint, 0644);
 /* Execute a list of actions against 'skb'. */
 static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
 			      struct sw_flow_key *key,
@@ -1039,6 +1042,8 @@ static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
 	 */
 	int prev_port = -1;
 	const struct nlattr *a;
+	struct ovs_encap_context *encap_context = NULL;
+	int tunnel_index = 0;
 	int rem;
 
 	for (a = attr, rem = len; rem > 0;
@@ -1049,8 +1054,8 @@ static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
 			struct sk_buff *out_skb = skb_clone(skb, GFP_ATOMIC);
 
 			if (out_skb)
-				do_output(dp, out_skb, prev_port, key);
-
+				do_output(dp, out_skb, prev_port, key, encap_context);
+			encap_context = NULL;
 			prev_port = -1;
 		}
 
@@ -1096,6 +1101,10 @@ static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
 
 		case OVS_ACTION_ATTR_SET:
 			err = execute_set_action(skb, key, nla_data(a));
+			if (withEncapAcceleration && !err && key->encap_contexts && key->encap_contexts->amount > tunnel_index) {
+				encap_context = &key->encap_contexts->data[tunnel_index];
+				tunnel_index++;
+			}
 			break;
 
 		case OVS_ACTION_ATTR_SET_MASKED:
@@ -1130,7 +1139,7 @@ static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
 	}
 
 	if (prev_port != -1)
-		do_output(dp, skb, prev_port, key);
+		do_output(dp, skb, prev_port, key, encap_context);
 	else
 		consume_skb(skb);
 

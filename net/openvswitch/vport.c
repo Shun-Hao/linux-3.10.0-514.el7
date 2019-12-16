@@ -490,7 +490,7 @@ static unsigned int packet_length(const struct sk_buff *skb)
 	return length;
 }
 
-void ovs_vport_send(struct vport *vport, struct sk_buff *skb)
+void ovs_vport_send(struct vport *vport, struct sk_buff *skb, struct ovs_encap_context* encap_context)
 {
 	int mtu = vport->dev->mtu;
 
@@ -502,7 +502,14 @@ void ovs_vport_send(struct vport *vport, struct sk_buff *skb)
 		goto drop;
 	}
 
-	skb->dev = vport->dev;
+	if (encap_context) {
+		skb->mark = encap_context->offload_id;
+		skb->dev = encap_context->egress_device;
+	}
+	else {
+		skb->dev = vport->dev;
+	}
+	
 	vport->ops->send(skb);
 	return;
 

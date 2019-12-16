@@ -54,6 +54,31 @@ struct ovs_tunnel_info {
 	(offsetof(struct sw_flow_key, recirc_id) +	\
 	FIELD_SIZEOF(struct sw_flow_key, recirc_id))
 
+struct ovs_encap_context {
+	/*VxLAN fields*/
+	__be64 vni;
+	/*L4 fields*/
+	__be16 dst_port;
+	/*L3 fields*/
+	__be32	saddr;
+	__be32	daddr;
+	__u8	ttl;
+	__u8	tos;
+	__be16	frag_off;
+	/*L2 fields*/
+	unsigned char	h_dest[ETH_ALEN];	/* destination eth addr	*/
+	unsigned char	h_source[ETH_ALEN];	/* source ether addr	*/
+	/*Egress device*/
+	struct net_device* egress_device;
+
+	int offload_id;
+};
+
+struct ovs_encap_contexts {
+	int amount;
+	struct ovs_encap_context data[];
+};
+
 struct sw_flow_key {
 	u8 tun_opts[255];
 	u8 tun_opts_len;
@@ -120,6 +145,7 @@ struct sw_flow_key {
 		struct ovs_key_ct_labels labels;
 	} ct;
 
+	struct ovs_encap_contexts* encap_contexts;
 } __aligned(BITS_PER_LONG/8); /* Ensure that we can do comparisons as longs. */
 
 struct sw_flow_key_range {

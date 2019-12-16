@@ -1130,6 +1130,7 @@ static int ovs_key_from_nlattrs(struct net *net, struct sw_flow_match *match,
 		return -EINVAL;
 	}
 
+	match->key->encap_contexts = NULL;
 	return 0;
 }
 

@@ -47,9 +47,12 @@
 #include <linux/openvswitch.h>
 #include <linux/rculist.h>
 #include <linux/dmi.h>
+#include <linux/mlx5/fs.h>
 #include <net/genetlink.h>
 #include <net/net_namespace.h>
 #include <net/netns/generic.h>
+#include <net/vxlan.h>
+#include <net/ip.h>
 
 #include "datapath.h"
 #include "flow.h"
@@ -287,6 +290,7 @@ void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
 
 	ovs_flow_stats_update(flow, key->tp.flags, skb);
 	sf_acts = rcu_dereference(flow->sf_acts);
+	key->encap_contexts = flow->key.encap_contexts;
 	ovs_execute_actions(dp, skb, sf_acts, key);
 
 	stats_counter = &stats->n_hit;
@@ -595,6 +599,7 @@ static int ovs_packet_cmd_execute(struct sk_buff *skb, struct genl_info *info)
 	err = PTR_ERR(flow);
 	if (IS_ERR(flow))
 		goto err_kfree_skb;
+	flow->key.encap_contexts = NULL;
 
 	err = ovs_flow_key_extract_userspace(net, a[OVS_PACKET_ATTR_KEY],
 					     packet, &flow->key, log);
@@ -905,6 +910,170 @@ static struct sk_buff *ovs_flow_cmd_build_info(const struct sw_flow *flow,
 	return skb;
 }
 
+static struct neighbour * get_neighbour(struct sk_buff *skb, struct ip_tunnel_info *tunnel_info)
+{
+	struct rtable *rt = NULL;
+	struct flowi4 fl4;
+	bool use_cache = ip_tunnel_dst_cache_usable(skb, tunnel_info);
+	int err = 0;
+
+	memset(&fl4, 0, sizeof(fl4));
+
+	fl4.flowi4_tos = tunnel_info->key.tos;
+	fl4.daddr = tunnel_info->key.u.ipv4.dst;
+	fl4.saddr = tunnel_info->key.u.ipv4.src;
+
+	if (use_cache) {
+		rt = dst_cache_get_ip4(&tunnel_info->dst_cache, &tunnel_info->key.u.ipv4.src);
+		if (!rt)
+			err = 1;
+	}
+	if (!use_cache || err) {
+		rt = ip_route_output_key(sock_net(skb->sk), &fl4);
+		if (IS_ERR(rt)) {
+			netdev_dbg(skb->dev, "no route to %pI4\n", &tunnel_info->key.u.ipv4.dst);
+			return ERR_PTR(-ENETUNREACH);
+		}
+		if (use_cache)
+			dst_cache_set_ip4(&tunnel_info->dst_cache, &rt->dst, fl4.saddr);
+	}
+
+	return dst_neigh_lookup(&rt->dst, &fl4.daddr);
+}
+
+static int build_encap_context(struct ovs_encap_context *encap_context, struct sk_buff *skb, struct ip_tunnel_info *tunnel_info)
+{
+	struct neighbour *neighbour;
+
+	neighbour = get_neighbour(skb, tunnel_info);
+	if (IS_ERR(neighbour))
+		return PTR_ERR(neighbour);
+
+	/*VxLAN fields*/
+	encap_context->vni = tunnel_info->key.tun_id;
+
+	/*L4 fields*/
+	encap_context->dst_port = tunnel_info->key.tp_dst;
+
+	/*L3 fields*/
+	encap_context->saddr = tunnel_info->key.u.ipv4.src;
+	encap_context->daddr = tunnel_info->key.u.ipv4.dst;
+	encap_context->ttl = tunnel_info->key.ttl;
+	encap_context->tos = tunnel_info->key.tos;
+	encap_context->frag_off = tunnel_info->key.tun_flags & TUNNEL_DONT_FRAGMENT ? htons(IP_DF) : 0;
+
+	/*L2 fields*/
+	ether_addr_copy(encap_context->h_dest, neighbour->ha);
+	ether_addr_copy(encap_context->h_source, neighbour->dev->dev_addr);
+
+	/*Egress device*/
+	encap_context->egress_device = neighbour->dev;
+
+	neigh_release(neighbour);
+
+	return 0;
+}
+
+static int amount_of_tunnel_actions(const struct nlattr *actions, int len)
+{
+	const struct nlattr *a;
+	int rem;
+	int tunnel_actions = 0;
+
+	for (a = actions, rem = len; rem > 0;
+	     a = nla_next(a, &rem)) {
+
+		if (nla_type(a) == OVS_ACTION_ATTR_SET) {
+			const struct nlattr *inner_a = nla_data(a);
+			if (nla_type(inner_a) == OVS_KEY_ATTR_TUNNEL_INFO) {
+				tunnel_actions++;
+			}
+		}
+	}
+
+	return tunnel_actions;
+}
+
+static struct ovs_encap_contexts *build_encap_contexts(struct sk_buff *skb, const struct nlattr *actions, int len)
+{
+	const struct nlattr *a;
+	struct ovs_encap_contexts *encap_contexts;
+	int rem;
+	int tunnel_actions = amount_of_tunnel_actions(actions, len);
+	int err = -ENODATA;
+	int context_index = 0;
+
+	if (tunnel_actions <= 0) {
+		return ERR_PTR(-ENODATA);
+	}
+
+	encap_contexts = kzalloc(sizeof(struct ovs_encap_contexts) + sizeof(struct ovs_encap_context) * tunnel_actions, GFP_KERNEL);
+	if (!encap_contexts)
+		return ERR_PTR(-ENOMEM);
+
+	encap_contexts->amount = tunnel_actions;
+
+	for (a = actions, rem = len; rem > 0;
+	     a = nla_next(a, &rem)) {
+
+		if (nla_type(a) == OVS_ACTION_ATTR_SET) {
+			const struct nlattr *inner_a = nla_data(a);
+			if (nla_type(inner_a) == OVS_KEY_ATTR_TUNNEL_INFO) {
+				struct ovs_tunnel_info *tun = nla_data(inner_a);
+				err = build_encap_context(&encap_contexts->data[context_index], skb, &tun->tun_dst->u.tun_info);
+				if (err)
+					goto error;
+			}
+		}
+	}
+	return encap_contexts;
+
+error:
+	kfree(encap_contexts);
+	return ERR_PTR(err);
+}
+
+static int offload_encap_context(struct ovs_encap_context *encap_context)
+{
+	int offload_id;
+
+	offload_id = mlx5e_insert_encap_context(encap_context->egress_device, encap_context->vni, encap_context->saddr, encap_context->daddr,
+				 encap_context->tos, encap_context->ttl, encap_context->frag_off, encap_context->dst_port, encap_context->h_source, encap_context->h_dest);
+	if (offload_id < 0)
+		return offload_id;
+
+	encap_context->offload_id = offload_id;
+
+	return 0;
+}
+
+static void onload_encap_context(struct ovs_encap_context *encap_context)
+{
+	mlx5e_remove_encap_context(encap_context->egress_device, encap_context->offload_id);
+}
+
+static int offload_encap_contexts(struct ovs_encap_contexts *encap_contexts)
+{
+	int context_index;
+	int err;
+
+	for (context_index = 0; context_index < encap_contexts->amount; context_index++) {
+		err = offload_encap_context(&encap_contexts->data[context_index]);
+		if (err)
+			return err;
+	}
+
+	return 0;
+}
+
+static void onload_encap_contexts(struct ovs_encap_contexts *encap_contexts)
+{
+	int context_index;
+
+	for (context_index = 0; context_index < encap_contexts->amount; context_index++)
+		onload_encap_context(&encap_contexts->data[context_index]);
+}
+
 static int ovs_flow_cmd_new(struct sk_buff *skb, struct genl_info *info)
 {
 	struct net *net = sock_net(skb->sk);
@@ -917,6 +1086,7 @@ static int ovs_flow_cmd_new(struct sk_buff *skb, struct genl_info *info)
 	struct sw_flow_key key;
 	struct sw_flow_actions *acts;
 	struct sw_flow_match match;
+	struct ovs_encap_contexts *encap_contexts;
 	u32 ufid_flags = ovs_nla_get_ufid_flags(a[OVS_FLOW_ATTR_UFID_FLAGS]);
 	int error;
 	bool log = !a[OVS_FLOW_ATTR_PROBE];
@@ -940,7 +1110,7 @@ static int ovs_flow_cmd_new(struct sk_buff *skb, struct genl_info *info)
 		error = PTR_ERR(new_flow);
 		goto error;
 	}
-
+	new_flow->key.encap_contexts = NULL;
 	/* Extract key. */
 	ovs_match_init(&match, &key, &mask);
 	error = ovs_nla_get_match(net, &match, a[OVS_FLOW_ATTR_KEY],
@@ -970,6 +1140,20 @@ static int ovs_flow_cmd_new(struct sk_buff *skb, struct genl_info *info)
 		error = PTR_ERR(reply);
 		goto err_kfree_acts;
 	}
+
+	encap_contexts = build_encap_contexts(skb, acts->actions, acts->actions_len);
+	if (IS_ERR(encap_contexts)) {
+		encap_contexts = NULL;
+	}
+	else {
+		error = offload_encap_contexts(encap_contexts);
+		if (error) {
+			kfree(encap_contexts);
+			encap_contexts = NULL;
+		}
+	}
+
+	new_flow->key.encap_contexts = encap_contexts;
 
 	ovs_lock();
 	dp = get_dp(net, ovs_header->dp_ifindex);
@@ -1057,6 +1241,8 @@ static int ovs_flow_cmd_new(struct sk_buff *skb, struct genl_info *info)
 err_unlock_ovs:
 	ovs_unlock();
 	kfree_skb(reply);
+	if (encap_contexts)
+		kfree(encap_contexts);
 err_kfree_acts:
 	ovs_nla_free_flow_actions(acts);
 err_kfree_flow:
@@ -1313,6 +1499,11 @@ static int ovs_flow_cmd_del(struct sk_buff *skb, struct genl_info *info)
 
 	ovs_flow_tbl_remove(&dp->table, flow);
 	ovs_unlock();
+
+	if (flow->key.encap_contexts) {
+		onload_encap_contexts(flow->key.encap_contexts);
+		kfree(flow->key.encap_contexts);
+	}
 
 	reply = ovs_flow_cmd_alloc_info((const struct sw_flow_actions __force *) flow->sf_acts,
 					&flow->id, info, false, ufid_flags);

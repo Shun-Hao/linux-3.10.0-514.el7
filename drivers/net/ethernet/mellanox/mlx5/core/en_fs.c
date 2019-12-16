@@ -1222,3 +1222,16 @@ void mlx5e_destroy_flow_tables(struct mlx5e_priv *priv)
 	mlx5e_destroy_main_flow_table(priv);
 	mlx5e_destroy_vlan_flow_table(priv);
 }
+
+int mlx5e_insert_encap_context(struct net_device *netdev, __be64 tun_id, __be32 src, __be32 dst,
+				 __u8 tos, __u8 ttl, __be16 frag_off, __be16 tp_dst, unsigned char *mac_source, unsigned char *mac_dest)
+{
+	return -EINVAL;
+}
+EXPORT_SYMBOL(mlx5e_insert_encap_context);
+
+void mlx5e_remove_encap_context(struct net_device *netdev, u32 encap_flow_tag)
+{
+	return;
+}
+EXPORT_SYMBOL(mlx5e_remove_encap_context);
