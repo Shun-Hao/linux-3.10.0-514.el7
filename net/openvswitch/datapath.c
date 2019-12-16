@@ -1125,11 +1125,7 @@ static int offload_decap_info(struct ovs_decap_info *decap_info, struct net_devi
 
 static int onload_decap_info(struct ovs_decap_info *decap_info, struct sk_buff *skb, struct ip_tunnel_key* tunnel_key)
 {
-	struct net_device *ingress_dev = get_ingress_dev(skb, tunnel_key);
-	if (IS_ERR(ingress_dev))
-		return PTR_ERR(ingress_dev);
-
-	mlx5e_remove_decap_match(ingress_dev, decap_info->tun_id, decap_info->dst, decap_info->tp_dst);
+	mlx5e_remove_decap_match(decap_info->ingress_dev, decap_info->tun_id, decap_info->dst, decap_info->tp_dst);
 	decap_info->valid = false;
 
 	return 0;
