@@ -79,6 +79,19 @@ struct ovs_encap_contexts {
 	struct ovs_encap_context data[];
 };
 
+struct ovs_decap_info {
+	struct net_device *ingress_dev;
+	__be64 tun_id;
+	__be32 src;
+	__be32 dst;
+	__u8 tos;
+	__u8 ttl;
+	__be16 tp_src;
+	__be16 tp_dst;
+	bool valid;
+	bool offloaded;
+};
+
 struct sw_flow_key {
 	u8 tun_opts[255];
 	u8 tun_opts_len;
@@ -204,6 +217,7 @@ struct sw_flow {
 	struct sw_flow_key key;
 	struct sw_flow_id id;
 	struct sw_flow_mask *mask;
+	struct ovs_decap_info decap_info;
 	struct sw_flow_actions __rcu *sf_acts;
 	struct flow_stats __rcu *stats[]; /* One for each NUMA node.  First one
 					   * is allocated at flow creation time,

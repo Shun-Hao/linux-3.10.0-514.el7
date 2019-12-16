@@ -941,6 +941,26 @@ static struct neighbour * get_neighbour(struct sk_buff *skb, struct ip_tunnel_in
 	return dst_neigh_lookup(&rt->dst, &fl4.daddr);
 }
 
+static struct net_device *get_ingress_dev(struct sk_buff *skb, struct ip_tunnel_key* tunnel_key)
+{
+	struct rtable *rt = NULL;
+	struct flowi4 fl4;
+
+	memset(&fl4, 0, sizeof(fl4));
+
+	fl4.flowi4_tos = tunnel_key->tos;
+	fl4.daddr = tunnel_key->u.ipv4.src;
+	fl4.saddr = tunnel_key->u.ipv4.dst;
+
+	rt = ip_route_output_key(sock_net(skb->sk), &fl4);
+	if (IS_ERR(rt)) {
+		netdev_dbg(skb->dev, "no route to %pI4\n", &tunnel_key->u.ipv4.dst);
+		return ERR_PTR(-ENETUNREACH);
+	}
+
+	return rt->dst.dev;
+}
+
 static int build_encap_context(struct ovs_encap_context *encap_context, struct sk_buff *skb, struct ip_tunnel_info *tunnel_info)
 {
 	struct neighbour *neighbour;
@@ -1074,6 +1094,47 @@ static void onload_encap_contexts(struct ovs_encap_contexts *encap_contexts)
 		onload_encap_context(&encap_contexts->data[context_index]);
 }
 
+static int build_decap_info(struct ovs_decap_info* decap_info, struct sk_buff *skb, struct ip_tunnel_key* tunnel_key)
+{
+	struct net_device *ingress_dev = get_ingress_dev(skb, tunnel_key);
+
+	if (IS_ERR(ingress_dev))
+		return PTR_ERR(ingress_dev);
+
+	decap_info->ingress_dev = ingress_dev;
+	decap_info->tun_id = tunnel_key->tun_id;
+	decap_info->src = tunnel_key->u.ipv4.src;
+	decap_info->dst = tunnel_key->u.ipv4.dst;
+	decap_info->tos = tunnel_key->tos;
+	decap_info->ttl = tunnel_key->ttl;
+	decap_info->tp_src = tunnel_key->tp_src;
+	decap_info->tp_dst = tunnel_key->tp_dst;
+	decap_info->valid = true;
+
+	return 0;
+}
+
+static int offload_decap_info(struct ovs_decap_info *decap_info, struct net_device *vxlan_device)
+{
+	mlx5e_insert_decap_match(decap_info->ingress_dev, decap_info->tun_id, decap_info->src, decap_info->dst,
+				 decap_info->tos, decap_info->ttl, decap_info->tp_src, decap_info->tp_dst, vxlan_device);
+	decap_info->offloaded = true;
+
+	return 0;
+}
+
+static int onload_decap_info(struct ovs_decap_info *decap_info, struct sk_buff *skb, struct ip_tunnel_key* tunnel_key)
+{
+	struct net_device *ingress_dev = get_ingress_dev(skb, tunnel_key);
+	if (IS_ERR(ingress_dev))
+		return PTR_ERR(ingress_dev);
+
+	mlx5e_remove_decap_match(ingress_dev, decap_info->tun_id, decap_info->dst, decap_info->tp_dst);
+	decap_info->valid = false;
+
+	return 0;
+}
+
 static int ovs_flow_cmd_new(struct sk_buff *skb, struct genl_info *info)
 {
 	struct net *net = sock_net(skb->sk);
@@ -1087,9 +1148,11 @@ static int ovs_flow_cmd_new(struct sk_buff *skb, struct genl_info *info)
 	struct sw_flow_actions *acts;
 	struct sw_flow_match match;
 	struct ovs_encap_contexts *encap_contexts;
+	struct vport *input_vport;
 	u32 ufid_flags = ovs_nla_get_ufid_flags(a[OVS_FLOW_ATTR_UFID_FLAGS]);
 	int error;
 	bool log = !a[OVS_FLOW_ATTR_PROBE];
+	int unmasked_inport;
 
 	/* Must have key and actions. */
 	error = -EINVAL;
@@ -1111,6 +1174,7 @@ static int ovs_flow_cmd_new(struct sk_buff *skb, struct genl_info *info)
 		goto error;
 	}
 	new_flow->key.encap_contexts = NULL;
+	new_flow->decap_info.valid = false;
 	/* Extract key. */
 	ovs_match_init(&match, &key, &mask);
 	error = ovs_nla_get_match(net, &match, a[OVS_FLOW_ATTR_KEY],
@@ -1118,13 +1182,17 @@ static int ovs_flow_cmd_new(struct sk_buff *skb, struct genl_info *info)
 	if (error)
 		goto err_kfree_flow;
 
-	ovs_flow_mask_key(&new_flow->key, &key, true, &mask);
+	if (new_flow->key.tun_key.tun_flags)
+		build_decap_info(&new_flow->decap_info, skb, &new_flow->key.tun_key);
 
 	/* Extract flow identifier. */
 	error = ovs_nla_get_identifier(&new_flow->id, a[OVS_FLOW_ATTR_UFID],
 				       &key, log);
 	if (error)
 		goto err_kfree_flow;
+
+	unmasked_inport = new_flow->key.phy.in_port;
+	ovs_flow_mask_key(&new_flow->key, &key, true, &mask);
 
 	/* Validate actions. */
 	error = ovs_nla_copy_actions(net, a[OVS_FLOW_ATTR_ACTIONS],
@@ -1187,6 +1255,14 @@ static int ovs_flow_cmd_new(struct sk_buff *skb, struct genl_info *info)
 			BUG_ON(error < 0);
 		}
 		ovs_unlock();
+
+		if (new_flow->decap_info.valid) {
+			input_vport = ovs_vport_rcu(dp, unmasked_inport);
+			if (input_vport && input_vport->dev) {
+				offload_decap_info(&new_flow->decap_info, input_vport->dev);
+			}
+		}
+
 	} else {
 		struct sw_flow_actions *old_acts;
 
@@ -1499,6 +1575,9 @@ static int ovs_flow_cmd_del(struct sk_buff *skb, struct genl_info *info)
 
 	ovs_flow_tbl_remove(&dp->table, flow);
 	ovs_unlock();
+
+	if (flow->decap_info.valid && flow->decap_info.offloaded)
+		onload_decap_info(&flow->decap_info, skb, &flow->key.tun_key);
 
 	if (flow->key.encap_contexts) {
 		onload_encap_contexts(flow->key.encap_contexts);
