@@ -964,6 +964,7 @@ static struct net_device *get_ingress_dev(struct sk_buff *skb, struct ip_tunnel_
 static int build_encap_context(struct ovs_encap_context *encap_context, struct sk_buff *skb, struct ip_tunnel_info *tunnel_info)
 {
 	struct neighbour *neighbour;
+	unsigned char zero_address[ETH_ALEN] = {0};
 
 	neighbour = get_neighbour(skb, tunnel_info);
 	if (IS_ERR(neighbour))
@@ -990,6 +991,9 @@ static int build_encap_context(struct ovs_encap_context *encap_context, struct s
 	encap_context->egress_device = neighbour->dev;
 
 	neigh_release(neighbour);
+
+	if (ether_addr_equal(encap_context->h_dest, zero_address))
+		return -EINVAL;
 
 	return 0;
 }
