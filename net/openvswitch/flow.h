@@ -88,6 +88,7 @@ struct ovs_decap_info {
 	__u8 ttl;
 	__be16 tp_src;
 	__be16 tp_dst;
+	u32  mark;
 	bool valid;
 	bool offloaded;
 };

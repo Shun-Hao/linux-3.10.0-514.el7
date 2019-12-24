@@ -1096,7 +1096,7 @@ static void onload_encap_contexts(struct ovs_encap_contexts *encap_contexts)
 		onload_encap_context(&encap_contexts->data[context_index]);
 }
 
-static int build_decap_info(struct ovs_decap_info* decap_info, struct sk_buff *skb, struct ip_tunnel_key* tunnel_key)
+static int build_decap_info(struct ovs_decap_info* decap_info, struct sk_buff *skb, struct ip_tunnel_key* tunnel_key, u32 mark)
 {
 	struct net_device *ingress_dev = get_ingress_dev(skb, tunnel_key);
 
@@ -1111,6 +1111,7 @@ static int build_decap_info(struct ovs_decap_info* decap_info, struct sk_buff *s
 	decap_info->ttl = tunnel_key->ttl;
 	decap_info->tp_src = tunnel_key->tp_src;
 	decap_info->tp_dst = tunnel_key->tp_dst;
+	decap_info->mark = mark;
 	decap_info->valid = true;
 
 	return 0;
@@ -1119,7 +1120,7 @@ static int build_decap_info(struct ovs_decap_info* decap_info, struct sk_buff *s
 static int offload_decap_info(struct ovs_decap_info *decap_info, struct net_device *vxlan_device)
 {
 	mlx5e_insert_decap_match(decap_info->ingress_dev, decap_info->tun_id, decap_info->src, decap_info->dst,
-				 decap_info->tos, decap_info->ttl, decap_info->tp_src, decap_info->tp_dst, vxlan_device);
+				 decap_info->tos, decap_info->ttl, decap_info->tp_src, decap_info->tp_dst, decap_info->mark, vxlan_device);
 	decap_info->offloaded = true;
 
 	return 0;
@@ -1181,7 +1182,7 @@ static int ovs_flow_cmd_new(struct sk_buff *skb, struct genl_info *info)
 		goto err_kfree_flow;
 
 	if (new_flow->key.tun_key.tun_flags)
-		build_decap_info(&new_flow->decap_info, skb, &new_flow->key.tun_key);
+		build_decap_info(&new_flow->decap_info, skb, &new_flow->key.tun_key, new_flow->key.phy.skb_mark);
 
 	/* Extract flow identifier. */
 	error = ovs_nla_get_identifier(&new_flow->id, a[OVS_FLOW_ATTR_UFID],
