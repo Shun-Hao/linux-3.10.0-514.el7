@@ -1043,6 +1043,8 @@ static struct ovs_encap_contexts *build_encap_contexts(struct sk_buff *skb, cons
 				err = build_encap_context(&encap_contexts->data[context_index], skb, &tun->tun_dst->u.tun_info);
 				if (err)
 					goto error;
+
+				context_index++;
 			}
 		}
 	}
