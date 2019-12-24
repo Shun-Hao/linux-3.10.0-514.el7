@@ -914,7 +914,8 @@ static struct neighbour * get_neighbour(struct sk_buff *skb, struct ip_tunnel_in
 {
 	struct rtable *rt = NULL;
 	struct flowi4 fl4;
-	bool use_cache = ip_tunnel_dst_cache_usable(skb, tunnel_info);
+	//bool use_cache = ip_tunnel_dst_cache_usable(skb, tunnel_info);
+	bool use_cache = false;
 	int err = 0;
 
 	memset(&fl4, 0, sizeof(fl4));
@@ -937,6 +938,9 @@ static struct neighbour * get_neighbour(struct sk_buff *skb, struct ip_tunnel_in
 		if (use_cache)
 			dst_cache_set_ip4(&tunnel_info->dst_cache, &rt->dst, fl4.saddr);
 	}
+
+	if (!tunnel_info->key.u.ipv4.src)
+		tunnel_info->key.u.ipv4.src = fl4.saddr;
 
 	return dst_neigh_lookup(&rt->dst, &fl4.daddr);
 }
@@ -974,7 +978,7 @@ static int build_encap_context(struct ovs_encap_context *encap_context, struct s
 	encap_context->vni = tunnel_info->key.tun_id;
 
 	/*L4 fields*/
-	encap_context->dst_port = tunnel_info->key.tp_dst;
+	encap_context->dst_port = tunnel_info->key.tp_dst ? : 0xb512;
 
 	/*L3 fields*/
 	encap_context->saddr = tunnel_info->key.u.ipv4.src;
@@ -1138,6 +1142,17 @@ static int onload_decap_info(struct ovs_decap_info *decap_info, struct sk_buff *
 	return 0;
 }
 
+static void update_decap_info_dst_port(struct ovs_decap_info *decap_info, struct net_device *vxlan_device)
+{
+	struct vxlan_dev *vxlan;
+
+	if (decap_info->tp_dst)
+		return;
+
+	vxlan = netdev_priv(vxlan_device);
+	decap_info->tp_dst = vxlan->cfg.dst_port;;
+}
+
 static int ovs_flow_cmd_new(struct sk_buff *skb, struct genl_info *info)
 {
 	struct net *net = sock_net(skb->sk);
@@ -1262,6 +1277,7 @@ static int ovs_flow_cmd_new(struct sk_buff *skb, struct genl_info *info)
 		if (new_flow->decap_info.valid) {
 			input_vport = ovs_vport_rcu(dp, unmasked_inport);
 			if (input_vport && input_vport->dev) {
+				update_decap_info_dst_port(&new_flow->decap_info, input_vport->dev);
 				offload_decap_info(&new_flow->decap_info, input_vport->dev);
 			}
 		}
