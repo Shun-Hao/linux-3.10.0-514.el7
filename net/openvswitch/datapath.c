@@ -1170,7 +1170,6 @@ static int ovs_flow_cmd_new(struct sk_buff *skb, struct genl_info *info)
 	u32 ufid_flags = ovs_nla_get_ufid_flags(a[OVS_FLOW_ATTR_UFID_FLAGS]);
 	int error;
 	bool log = !a[OVS_FLOW_ATTR_PROBE];
-	int unmasked_inport;
 
 	/* Must have key and actions. */
 	error = -EINVAL;
@@ -1200,6 +1199,8 @@ static int ovs_flow_cmd_new(struct sk_buff *skb, struct genl_info *info)
 	if (error)
 		goto err_kfree_flow;
 
+	ovs_flow_mask_key(&new_flow->key, &key, true, &mask);
+
 	if (new_flow->key.tun_key.tun_flags)
 		build_decap_info(&new_flow->decap_info, skb, &new_flow->key.tun_key, new_flow->key.phy.skb_mark);
 
@@ -1208,9 +1209,6 @@ static int ovs_flow_cmd_new(struct sk_buff *skb, struct genl_info *info)
 				       &key, log);
 	if (error)
 		goto err_kfree_flow;
-
-	unmasked_inport = new_flow->key.phy.in_port;
-	ovs_flow_mask_key(&new_flow->key, &key, true, &mask);
 
 	/* Validate actions. */
 	error = ovs_nla_copy_actions(net, a[OVS_FLOW_ATTR_ACTIONS],
@@ -1275,7 +1273,7 @@ static int ovs_flow_cmd_new(struct sk_buff *skb, struct genl_info *info)
 		ovs_unlock();
 
 		if (new_flow->decap_info.valid) {
-			input_vport = ovs_vport_rcu(dp, unmasked_inport);
+			input_vport = ovs_vport_rcu(dp, new_flow->key.phy.in_port);
 			if (input_vport && input_vport->dev) {
 				update_decap_info_dst_port(&new_flow->decap_info, input_vport->dev);
 				offload_decap_info(&new_flow->decap_info, input_vport->dev);
