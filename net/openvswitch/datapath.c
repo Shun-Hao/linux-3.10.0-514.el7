@@ -1277,6 +1277,8 @@ static int ovs_flow_cmd_new(struct sk_buff *skb, struct genl_info *info)
 			if (input_vport && input_vport->dev) {
 				update_decap_info_dst_port(&new_flow->decap_info, input_vport->dev);
 				offload_decap_info(&new_flow->decap_info, input_vport->dev);
+			} else {
+				new_flow->decap_info.valid = false;
 			}
 		}
 
