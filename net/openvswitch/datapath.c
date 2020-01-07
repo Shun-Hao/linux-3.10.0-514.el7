@@ -1118,7 +1118,7 @@ static int build_decap_info(struct ovs_decap_info* decap_info, struct sk_buff *s
 	decap_info->tos = tunnel_key->tos;
 	decap_info->ttl = tunnel_key->ttl;
 	decap_info->tp_src = tunnel_key->tp_src;
-	decap_info->tp_dst = tunnel_key->tp_dst;
+	decap_info->tp_dst = tunnel_key->tp_dst ? : 0xb512;
 	decap_info->mark = mark;
 	decap_info->valid = true;
 
@@ -1140,17 +1140,6 @@ static int onload_decap_info(struct ovs_decap_info *decap_info, struct sk_buff *
 	decap_info->valid = false;
 
 	return 0;
-}
-
-static void update_decap_info_dst_port(struct ovs_decap_info *decap_info, struct net_device *vxlan_device)
-{
-	struct vxlan_dev *vxlan;
-
-	if (decap_info->tp_dst)
-		return;
-
-	vxlan = netdev_priv(vxlan_device);
-	decap_info->tp_dst = vxlan->cfg.dst_port;;
 }
 
 static int ovs_flow_cmd_new(struct sk_buff *skb, struct genl_info *info)
@@ -1275,7 +1264,6 @@ static int ovs_flow_cmd_new(struct sk_buff *skb, struct genl_info *info)
 		if (new_flow->decap_info.valid) {
 			input_vport = ovs_vport_rcu(dp, new_flow->key.phy.in_port);
 			if (input_vport && input_vport->dev) {
-				update_decap_info_dst_port(&new_flow->decap_info, input_vport->dev);
 				offload_decap_info(&new_flow->decap_info, input_vport->dev);
 			} else {
 				new_flow->decap_info.valid = false;
